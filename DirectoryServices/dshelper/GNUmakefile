@@ -25,8 +25,19 @@ include $(GNUSTEP_MAKEFILES)/tool.make
 # Install service files (platform-specific)
 after-install::
 ifeq ($(findstring freebsd,$(GNUSTEP_HOST_OS)),freebsd)
-	$(MKINSTALLDIRS) /usr/local/etc/rc.d
-	$(INSTALL) -m 555 dshelper.rc /usr/local/etc/rc.d/dshelper
+	@# NextBSD compiles as FreeBSD (config.guess does not know it) but boots
+	@# launchd, so the init system is detected here rather than from
+	@# $(GNUSTEP_HOST_OS). /usr/lib/system is the marker used elsewhere.
+	@if [ -d /usr/lib/system ] && command -v launchctl >/dev/null 2>&1; then \
+		$(MKINSTALLDIRS) /System/Library/LaunchDaemons; \
+		$(INSTALL) -m 644 org.gnustep.gdomap.plist /System/Library/LaunchDaemons/org.gnustep.gdomap.plist; \
+		$(INSTALL) -m 644 io.github.gershwin-desktop.dshelper.plist /System/Library/LaunchDaemons/io.github.gershwin-desktop.dshelper.plist; \
+		echo "Installed launchd daemons (gdomap + dshelper)"; \
+	else \
+		$(MKINSTALLDIRS) /usr/local/etc/rc.d; \
+		$(INSTALL) -m 555 dshelper.rc /usr/local/etc/rc.d/dshelper; \
+		echo "Installed rc.d script (dshelper)"; \
+	fi
 endif
 ifeq ($(findstring linux,$(GNUSTEP_HOST_OS)),linux)
 	@if command -v systemctl >/dev/null 2>&1; then \

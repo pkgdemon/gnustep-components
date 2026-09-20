@@ -7,6 +7,12 @@
 #import <netinet/in.h>
 #import <arpa/inet.h>
 
+// NextBSD launch daemons, installed by the dshelper makefile.  The labels
+// match the plist filenames under DS_LAUNCHD_DIR.
+#define DS_LAUNCHD_DIR    @"/System/Library/LaunchDaemons"
+#define DS_GDOMAP_LABEL   @"org.gnustep.gdomap"
+#define DS_DSHELPER_LABEL @"io.github.gershwin-desktop.dshelper"
+
 @interface DSPlatformFreeBSD : NSObject <DSPlatform>
 @end
 
@@ -56,6 +62,108 @@
 {
     NSString *cmd = [NSString stringWithFormat:@"service %@ restart >/dev/null 2>&1", service];
     return [self runCommand:cmd];
+}
+
+#pragma mark - Directory Services Daemons
+
+// NextBSD is FreeBSD with launchd, so it compiles as FreeBSD and lands in this
+// backend; the init system has to be told apart at run time.  /usr/lib/system
+// is the same marker install-system-domain.sh uses.
+- (BOOL)hasLaunchd
+{
+    struct stat st;
+
+    if (stat("/usr/lib/system", &st) != 0) {
+        return NO;
+    }
+    return [self runCommand:@"command -v launchctl >/dev/null 2>&1"];
+}
+
+- (BOOL)launchdJobLoaded:(NSString *)label
+{
+    NSString *cmd = [NSString stringWithFormat:
+        @"launchctl list 2>/dev/null | awk '{ print $3 }' | grep -qx '%@'", label];
+    return [self runCommand:cmd];
+}
+
+- (BOOL)launchdLoadJob:(NSString *)label
+{
+    if ([self launchdJobLoaded:label]) {
+        printf("%s is already running\n", [label UTF8String]);
+        return YES;
+    }
+
+    // -w clears the job's Disabled key, so it comes up at boot as well.
+    NSString *cmd = [NSString stringWithFormat:
+        @"launchctl load -w %@/%@.plist >/dev/null 2>&1",
+        DS_LAUNCHD_DIR, label];
+
+    if ([self runCommand:cmd]) {
+        printf("Enabled and started %s\n", [label UTF8String]);
+        return YES;
+    }
+
+    fprintf(stderr, "Warning: Could not load %s\n", [label UTF8String]);
+    return NO;
+}
+
+- (BOOL)enableLaunchdServices
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL success = YES;
+
+    // The plists are installed by the dshelper makefile; without them there is
+    // nothing to load and launchctl would only produce a confusing error.
+    for (NSString *label in @[DS_GDOMAP_LABEL, DS_DSHELPER_LABEL]) {
+        NSString *path = [NSString stringWithFormat:@"%@/%@.plist",
+                          DS_LAUNCHD_DIR, label];
+        if (![fm fileExistsAtPath:path]) {
+            fprintf(stderr, "Warning: %s not found; reinstall DirectoryServices\n",
+                    [path UTF8String]);
+            return NO;
+        }
+    }
+
+    // gdomap first: dshelper exits when gdomap is not reachable yet and then
+    // leans on KeepAlive to retry, so loading in order avoids that churn.
+    if (![self launchdLoadJob:DS_GDOMAP_LABEL]) {
+        success = NO;
+    }
+    if (![self launchdLoadJob:DS_DSHELPER_LABEL]) {
+        success = NO;
+    }
+
+    return success;
+}
+
+- (BOOL)enableDirectoryServices
+{
+    if ([self hasLaunchd]) {
+        return [self enableLaunchdServices];
+    }
+
+    // Stock FreeBSD rc.d: the dshelper rc script starts and stops gdomap
+    // alongside dshelper, so there is only one service to drive.
+    BOOL success = YES;
+
+    if (![self serviceEnable:@"dshelper"]) {
+        fprintf(stderr, "Warning: Could not enable dshelper at boot\n");
+        success = NO;
+    }
+
+    if ([self serviceIsRunning:@"dshelper"]) {
+        printf("dshelper is already running\n");
+        return success;
+    }
+
+    if ([self serviceStart:@"dshelper"]) {
+        printf("Started dshelper (with gdomap)\n");
+    } else {
+        fprintf(stderr, "Warning: Could not start dshelper\n");
+        success = NO;
+    }
+
+    return success;
 }
 
 - (NSString *)readFile:(NSString *)path

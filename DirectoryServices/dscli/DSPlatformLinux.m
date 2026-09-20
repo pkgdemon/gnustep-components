@@ -110,6 +110,40 @@
     return [self runCommand:cmd];
 }
 
+#pragma mark - Directory Services Daemons
+
+- (BOOL)enableDirectoryServices
+{
+    // Under systemd gdomap is a unit in its own right.  The sysvinit script
+    // starts and stops gdomap alongside dshelper, so there only one service
+    // to drive there.
+    NSArray *services = [self hasSystemd] ? @[@"gdomap", @"dshelper"]
+                                          : @[@"dshelper"];
+    BOOL success = YES;
+
+    for (NSString *service in services) {
+        if (![self serviceEnable:service]) {
+            fprintf(stderr, "Warning: Could not enable %s at boot\n",
+                    [service UTF8String]);
+            success = NO;
+        }
+
+        if ([self serviceIsRunning:service]) {
+            printf("%s is already running\n", [service UTF8String]);
+            continue;
+        }
+
+        if ([self serviceStart:service]) {
+            printf("Started %s\n", [service UTF8String]);
+        } else {
+            fprintf(stderr, "Warning: Could not start %s\n", [service UTF8String]);
+            success = NO;
+        }
+    }
+
+    return success;
+}
+
 - (NSString *)readFile:(NSString *)path
 {
     NSError *error = nil;

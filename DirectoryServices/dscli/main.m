@@ -1291,6 +1291,16 @@ static int cmdInit(void) {
         return 1;
     }
 
+    // Enable and start the Directory Services daemons (gdomap + dshelper).
+    // Only starts what is not already running, so re-running init is cheap.
+    printf("\nConfiguring services...\n");
+    id<DSPlatform> platform = DSPlatformCreate();
+    if (platform && [platform isAvailable]) {
+        [platform enableDirectoryServices];
+    } else {
+        printf("No platform backend available; skipping service setup.\n");
+    }
+
     printf("\nDirectory Services initialized.\n");
     return 0;
 }
