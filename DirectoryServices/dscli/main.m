@@ -2,6 +2,8 @@
 #import <unistd.h>
 #import <pwd.h>
 #import <grp.h>
+#import <errno.h>
+#import <string.h>
 #import "DSPlatform.h"
 
 // Network paths (checked first - used when mounted from server)
@@ -31,6 +33,129 @@ static NSString *getGroupsPlistPath(void) {
     return DS_LOCAL_GROUPS_PLIST;
 }
 
+// Login shell for new accounts: bash where it is installed (/usr/local/bin
+// on the BSDs), falling back to the POSIX shell every system has.
+static NSString *defaultShell(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *candidates = @[@"/bin/bash", @"/usr/local/bin/bash"];
+
+    for (NSString *shell in candidates) {
+        if ([fm isExecutableFileAtPath:shell]) {
+            return shell;
+        }
+    }
+    return @"/bin/sh";
+}
+
+
+// Skeleton copied into every new home directory.  Installed from the
+// gnustep-system repository (Library/User Template), which is where skeleton
+// dotfiles such as .xinitrc live -- dscli copies whatever is there verbatim.
+#define DS_USER_TEMPLATE @"/System/Library/User Template"
+
+// Standard folders created in every home directory.
+static NSArray *standardHomeFolders(void) {
+    return @[
+        @"Applications",
+        @"Desktop",
+        @"Documents",
+        @"Downloads",
+        @"Library",
+        @"Music",
+        @"Pictures",
+        @"Public",
+        @"Templates",
+        @"Videos"
+    ];
+}
+
+// Hand a single path to the user and the user's primary group.
+static void setOwner(NSString *path, uid_t uid, gid_t gid) {
+    if (lchown([path fileSystemRepresentation], uid, gid) != 0) {
+        fprintf(stderr, "Warning: Could not set owner on %s: %s\n",
+                [path UTF8String], strerror(errno));
+    }
+}
+
+// Same, for a path and everything underneath it (symlinks are not followed).
+static void setOwnerRecursive(NSString *path, uid_t uid, gid_t gid) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    setOwner(path, uid, gid);
+
+    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:path];
+    NSString *relative;
+    while ((relative = [enumerator nextObject]) != nil) {
+        setOwner([path stringByAppendingPathComponent:relative], uid, gid);
+    }
+}
+
+// Create (or repair) a home directory: the user template plus the standard
+// folders, all owned by the user and the user's primary group.  Existing
+// files are never overwritten, so this is safe to run against a home
+// directory that is already populated.
+static void setupHomeDirectory(NSString *homeDir, uid_t uid, gid_t gid) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *error = nil;
+    NSDictionary *dirAttrs = @{
+        NSFilePosixPermissions: @0755,
+        NSFileOwnerAccountID: @(uid),
+        NSFileGroupOwnerAccountID: @(gid)
+    };
+
+    if (![fm fileExistsAtPath:homeDir]) {
+        [fm createDirectoryAtPath:homeDir
+      withIntermediateDirectories:YES
+                       attributes:dirAttrs
+                            error:&error];
+        if (error) {
+            fprintf(stderr, "Warning: Failed to create home directory %s: %s\n",
+                    [homeDir UTF8String], [[error localizedDescription] UTF8String]);
+            return;
+        }
+        printf("Created home directory: %s\n", [homeDir UTF8String]);
+    }
+
+    // createDirectoryAtPath: only applies attributes to directories it
+    // actually creates, so claim the home directory unconditionally.
+    setOwner(homeDir, uid, gid);
+
+    // Copy the user template (skeleton dotfiles) into the new home.
+    if ([fm fileExistsAtPath:DS_USER_TEMPLATE]) {
+        NSArray *entries = [fm contentsOfDirectoryAtPath:DS_USER_TEMPLATE error:NULL];
+        for (NSString *entry in entries) {
+            NSString *source = [DS_USER_TEMPLATE stringByAppendingPathComponent:entry];
+            NSString *destination = [homeDir stringByAppendingPathComponent:entry];
+            if ([fm fileExistsAtPath:destination]) {
+                continue;
+            }
+            error = nil;
+            if ([fm copyItemAtPath:source toPath:destination error:&error]) {
+                setOwnerRecursive(destination, uid, gid);
+            } else {
+                fprintf(stderr, "Warning: Could not copy %s: %s\n",
+                        [entry UTF8String], [[error localizedDescription] UTF8String]);
+            }
+        }
+    }
+
+    for (NSString *folder in standardHomeFolders()) {
+        NSString *path = [homeDir stringByAppendingPathComponent:folder];
+        if (![fm fileExistsAtPath:path]) {
+            error = nil;
+            [fm createDirectoryAtPath:path
+          withIntermediateDirectories:YES
+                           attributes:dirAttrs
+                                error:&error];
+            if (error) {
+                fprintf(stderr, "Warning: Could not create %s: %s\n",
+                        [path UTF8String], [[error localizedDescription] UTF8String]);
+                continue;
+            }
+        }
+        setOwner(path, uid, gid);
+    }
+}
 
 static void printUsage(const char *progname) {
     fprintf(stderr, "Usage: %s <command> [options]\n\n", progname);
@@ -41,7 +166,8 @@ static void printUsage(const char *progname) {
     fprintf(stderr, "    --uid <uid>                 User ID (auto-assigned if omitted)\n");
     fprintf(stderr, "    --gid <gid>                 Primary group ID (auto-assigned if omitted)\n");
     fprintf(stderr, "    --realname <name>           Real name / GECOS\n");
-    fprintf(stderr, "    --shell <shell>             Login shell (default: /bin/sh)\n");
+    fprintf(stderr, "    --shell <shell>             Login shell (default: %s)\n",
+            [defaultShell() UTF8String]);
     fprintf(stderr, "    --admin                     Add user to admin group\n");
     fprintf(stderr, "  user delete <username>        Delete a user\n");
     fprintf(stderr, "  user passwd <username>        Set user password\n");
@@ -179,6 +305,26 @@ static gid_t findNextGID(NSDictionary *groups) {
         }
     }
     return maxGID + 1;
+}
+
+// Name of the group holding this GID, or nil if no group has it.
+static NSString *groupNameForGID(NSDictionary *groups, gid_t gid) {
+    for (NSString *groupname in groups) {
+        if (getGIDValue(groups[groupname][@"gid"]) == gid) {
+            return groupname;
+        }
+    }
+    return nil;
+}
+
+// Is this GID the primary group of any user?
+static BOOL gidIsPrimaryForAnyUser(NSDictionary *users, gid_t gid) {
+    for (NSString *username in users) {
+        if (getGIDValue(users[username][@"gid"]) == gid) {
+            return YES;
+        }
+    }
+    return NO;
 }
 
 #pragma mark - List All Command
@@ -386,7 +532,7 @@ static int cmdUserAdd(NSArray *args) {
     uid_t uid = 0;
     gid_t gid = 0;
     NSString *realName = nil;
-    NSString *shell = @"/bin/sh";
+    NSString *shell = defaultShell();
     BOOL addToAdmin = NO;
 
     for (NSUInteger i = 1; i < [args count]; i++) {
@@ -409,9 +555,15 @@ static int cmdUserAdd(NSArray *args) {
         uid = findNextUID(users);
     }
 
-    // Auto-assign GID (create user's private group) if not specified
+    // Auto-assign GID (the user's private group) if not specified.  A group
+    // already named after the user is reused rather than allocating a fresh
+    // GID, so that the user's primary GID always names a group that exists.
     if (gid == 0) {
-        gid = findNextGID(groups);
+        if (groups[username]) {
+            gid = getGIDValue(groups[username][@"gid"]);
+        } else {
+            gid = findNextGID(groups);
+        }
     }
 
     // Create user record
@@ -426,23 +578,23 @@ static int cmdUserAdd(NSArray *args) {
 
     users[username] = user;
 
-    // Create user's private group if it doesn't exist
-    if (!groups[username]) {
-        NSMutableDictionary *userGroup = [NSMutableDictionary dictionary];
-        userGroup[@"groupname"] = username;
-        userGroup[@"gid"] = @(gid);
-        userGroup[@"members"] = @[username];
-        groups[username] = userGroup;
-    } else {
-        // Group already exists, ensure user is a member
-        NSMutableDictionary *userGroup = [groups[username] mutableCopy];
-        NSMutableArray *members = [userGroup[@"members"] mutableCopy] ?: [NSMutableArray array];
-        if (![members containsObject:username]) {
-            [members addObject:username];
-        }
-        userGroup[@"members"] = members;
-        groups[username] = userGroup;
+    // Make sure the primary group exists and lists the user as a member.
+    // When the GID already belongs to a group (an explicit --gid, or a
+    // private group left over from an earlier account) that group is used
+    // instead of creating a second group with a duplicate GID.
+    NSString *primaryGroupName = groupNameForGID(groups, gid) ?: username;
+    NSMutableDictionary *primaryGroup = [groups[primaryGroupName] mutableCopy];
+    if (!primaryGroup) {
+        primaryGroup = [NSMutableDictionary dictionary];
+        primaryGroup[@"groupname"] = primaryGroupName;
+        primaryGroup[@"gid"] = @(gid);
     }
+    NSMutableArray *primaryMembers = [primaryGroup[@"members"] mutableCopy] ?: [NSMutableArray array];
+    if (![primaryMembers containsObject:username]) {
+        [primaryMembers addObject:username];
+    }
+    primaryGroup[@"members"] = primaryMembers;
+    groups[primaryGroupName] = primaryGroup;
 
     // Add to admin group if requested
     if (addToAdmin) {
@@ -468,27 +620,9 @@ static int cmdUserAdd(NSArray *args) {
         return 1;
     }
 
-    // Create home directory
+    // Create and populate the home directory
     NSString *homeDir = [NSString stringWithFormat:@"/Local/Users/%@", username];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSError *error = nil;
-
-    if (![fm fileExistsAtPath:homeDir]) {
-        [fm createDirectoryAtPath:homeDir
-      withIntermediateDirectories:YES
-                       attributes:@{
-                           NSFilePosixPermissions: @0755,
-                           NSFileOwnerAccountID: @(uid),
-                           NSFileGroupOwnerAccountID: @(gid)
-                       }
-                            error:&error];
-        if (error) {
-            fprintf(stderr, "Warning: Failed to create home directory: %s\n",
-                    [[error localizedDescription] UTF8String]);
-        } else {
-            printf("Created home directory: %s\n", [homeDir UTF8String]);
-        }
-    }
+    setupHomeDirectory(homeDir, uid, gid);
 
     printf("User created: %s (uid=%d, gid=%d)\n", [username UTF8String], uid, gid);
     printf("Run 'dscli passwd %s' to set password.\n", [username UTF8String]);
@@ -531,6 +665,22 @@ static int cmdUserDelete(NSString *username) {
             groups[groupname] = group;
             groupsModified = YES;
         }
+    }
+
+    // Drop the user's private group: a group named after the user, holding
+    // the user's primary GID, that nobody else is in or has as a primary
+    // group.  Leaving it behind would collide with a later 'user add' for
+    // the same name.
+    gid_t gid = getGIDValue(user[@"gid"]);
+    NSDictionary *privateGroup = groups[username];
+    if (privateGroup &&
+        ![username isEqualToString:@"admin"] &&
+        getGIDValue(privateGroup[@"gid"]) == gid &&
+        [privateGroup[@"members"] count] == 0 &&
+        !gidIsPrimaryForAnyUser(users, gid)) {
+        [groups removeObjectForKey:username];
+        groupsModified = YES;
+        printf("Deleted private group: %s\n", [username UTF8String]);
     }
 
     if (groupsModified) {
@@ -1107,28 +1257,15 @@ static int cmdInit(void) {
                 @"uid": @5000,
                 @"gid": @5000,
                 @"realName": @"Administrator",
-                @"shell": @"/bin/sh",
+                @"shell": defaultShell(),
                 @"noPassword": @YES
             }
         };
         savePlist(users, DS_LOCAL_USERS_PLIST);
         printf("Created: %s (with default admin user)\n", [DS_LOCAL_USERS_PLIST UTF8String]);
 
-        // Create admin home directory
-        NSString *adminHome = @"/Local/Users/admin";
-        if (![fm fileExistsAtPath:adminHome]) {
-            [fm createDirectoryAtPath:adminHome
-          withIntermediateDirectories:YES
-                           attributes:@{
-                               NSFilePosixPermissions: @0755,
-                               NSFileOwnerAccountID: @5000,
-                               NSFileGroupOwnerAccountID: @5000
-                           }
-                                error:&error];
-            if (!error) {
-                printf("Created: %s\n", [adminHome UTF8String]);
-            }
-        }
+        // Create and populate the admin home directory
+        setupHomeDirectory(@"/Local/Users/admin", 5000, 5000);
     }
 
     if (![fm fileExistsAtPath:DS_LOCAL_GROUPS_PLIST]) {

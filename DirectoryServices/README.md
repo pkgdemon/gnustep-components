@@ -160,7 +160,7 @@ Options for `user add` and `user edit`:
 --uid <uid>           User ID (auto-assigned if omitted)
 --gid <gid>           Primary group ID (auto-assigned if omitted)
 --realname <name>     Real name / GECOS field
---shell <shell>       Login shell (default: /bin/sh)
+--shell <shell>       Login shell (default: /bin/bash if installed, else /bin/sh)
 --admin               Add user to admin group
 ```
 
@@ -341,6 +341,23 @@ The directory structure is created even if sudo is not yet installed, so sudo wi
 | passwordHash | yes* | SHA-512 hash (*for login) |
 
 Home directory is derived automatically: `/Local/Users/<username>` on server, `/Network/Users/<username>` on client.
+
+### Home Directory Provisioning
+
+`dscli user add` (and the `admin` account created by `dscli init`) populates the
+new home directory, with everything owned by the user and the user's primary
+group:
+
+1. The contents of `/System/Library/User Template`, if that directory exists.
+   This is where skeleton dotfiles such as `.xinitrc` live; everything there is
+   copied verbatim into every new home. The template itself is installed from
+   the `gnustep-system` repository (`Library/User Template`), not from here —
+   add skeleton files there, not to `dscli`.
+2. The standard folders: `Applications`, `Desktop`, `Documents`, `Downloads`,
+   `Library`, `Music`, `Pictures`, `Public`, `Templates`, `Videos`.
+
+Existing files are never overwritten, so this is safe to re-run against a home
+directory that is already populated.
 
 ### Group Fields
 
